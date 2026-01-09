@@ -774,10 +774,20 @@ final class GcsSinkConfigTest {
     }
 
     @Test
-    void wrongRequestCommitIntervalConfig() {
+    void invalidRequestCommitIntervalType() {
         final Map<String, String> properties = Map.of("gcs.bucket.name", "test-bucket",
                 "gcs.request.commit.interval.ms", "test-value");
-        final var expectedErrorMessage = "Invalid value test-value for configuration gcs.request.commit.interval.ms: Not a number of type LONG";
+        final var expectedErrorMessage = "Invalid value test-value for configuration gcs.request.commit.interval.ms: Not a number of type INT";
+
+        assertThatThrownBy(() -> new GcsSinkConfig(properties)).isInstanceOf(ConfigException.class)
+                .hasMessage(expectedErrorMessage);
+    }
+
+    @Test
+    void invalidRequestCommitIntervalValue() {
+        final Map<String, String> properties = Map.of("gcs.bucket.name", "test-bucket",
+                "gcs.request.commit.interval.ms", "-1000");
+        final var expectedErrorMessage = "Invalid value -1000 for configuration gcs.request.commit.interval.ms: Value must be at least -1";
 
         assertThatThrownBy(() -> new GcsSinkConfig(properties)).isInstanceOf(ConfigException.class)
                 .hasMessage(expectedErrorMessage);
