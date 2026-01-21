@@ -232,6 +232,7 @@ final class GcsSinkConfigTest {
         properties.put("file.max.records", "42");
         properties.put("format.output.fields", "key,value,offset,timestamp");
         properties.put("format.output.fields.value.encoding", "base64");
+        properties.put("gcs.records.buffered.bytes.soft.limit", "100000000");
 
         assertConfigDefValidationPasses(properties);
 
@@ -256,7 +257,7 @@ final class GcsSinkConfigTest {
 
         assertThat(config.getFilenameTimezone()).isEqualTo(ZoneOffset.UTC);
         assertThat(config.getFilenameTimestampSource()).isInstanceOf(TimestampSource.WallclockTimestampSource.class);
-
+        assertThat(config.getGcsRecordsBufferedBytesSoftLimit()).isEqualTo(100_000_000L);
     }
 
     @ParameterizedTest
@@ -770,6 +771,26 @@ final class GcsSinkConfigTest {
                         String.format("When file.name.template is %s, file.max.records must be either 1 or not set",
                                 fileNameTemplate))
                 .isInstanceOf(ConfigException.class);
+    }
+
+    @Test
+    void invalidRecordsBufferedBytesSoftLimitType() {
+        final Map<String, String> properties = Map.of("gcs.bucket.name", "test-bucket",
+                "gcs.records.buffered.bytes.soft.limit", "test-value");
+        final var expectedErrorMessage = "Invalid value test-value for configuration gcs.records.buffered.bytes.soft.limit: Not a number of type LONG";
+
+        assertThatThrownBy(() -> new GcsSinkConfig(properties)).isInstanceOf(ConfigException.class)
+                .hasMessage(expectedErrorMessage);
+    }
+
+    @Test
+    void invalidRecordsBufferedBytesSoftLimitValue() {
+        final Map<String, String> properties = Map.of("gcs.bucket.name", "test-bucket",
+                "gcs.records.buffered.bytes.soft.limit", "-1");
+        final var expectedErrorMessage = "Invalid value -1 for configuration gcs.records.buffered.bytes.soft.limit: Value must be at least 0";
+
+        assertThatThrownBy(() -> new GcsSinkConfig(properties)).isInstanceOf(ConfigException.class)
+                .hasMessage(expectedErrorMessage);
     }
 
     private void assertConfigDefValidationPasses(final Map<String, String> properties) {

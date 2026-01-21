@@ -19,10 +19,11 @@ package io.aiven.kafka.connect.gcs;
 import static java.util.Map.entry;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -34,9 +35,12 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
@@ -63,6 +67,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
+import org.mockito.ArgumentMatchers;
 
 final class GcsSinkTaskTest {
 
@@ -149,7 +154,9 @@ final class GcsSinkTaskTest {
     @ValueSource(strings = { "none", "gzip", "snappy", "zstd" })
     void basic(final String compression) {
         properties.put(GcsSinkConfig.FILE_COMPRESSION_TYPE_CONFIG, compression);
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         task.put(basicRecords);
         task.flush(null);
@@ -172,7 +179,9 @@ final class GcsSinkTaskTest {
     void basicWithHeaders(final String compression) {
         properties.put(GcsSinkConfig.FILE_COMPRESSION_TYPE_CONFIG, compression);
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_FIELDS_CONFIG, "key,value,timestamp,offset,headers");
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         final List<Record> records = createTestRecords();
         final List<SinkRecord> sinkRecords = toSinkRecords(records);
@@ -196,7 +205,9 @@ final class GcsSinkTaskTest {
     void basicValuesPlain(final String compression) {
         properties.put(GcsSinkConfig.FILE_COMPRESSION_TYPE_CONFIG, compression);
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_FIELDS_VALUE_ENCODING_CONFIG, "none");
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         task.put(basicRecords);
         task.flush(null);
@@ -214,12 +225,62 @@ final class GcsSinkTaskTest {
         });
     }
 
+    @Test
+    void recordsBufferedBytesSoftLimitTriggersCommitAndPause() {
+        // Set a soft limit of 20 bytes for buffered records.
+        final long softLimitBytes = 20L;
+        properties.put(GcsSinkConfig.GCS_RECORDS_BUFFERED_BYTES_SOFT_LIMIT_CONFIG, String.valueOf(softLimitBytes));
+
+        final var mockedContext = mock(SinkTaskContext.class);
+        final TopicPartition testTp = new TopicPartition("topic0", 0);
+        when(mockedContext.assignment()).thenReturn(Set.of(testTp));
+
+        final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
+
+        // ACT & ASSERT - Step 1: Initial state
+        verify(mockedContext, times(0)).requestCommit();
+        verify(mockedContext, times(0)).pause(ArgumentMatchers.any());
+
+        // ACT & ASSERT - Step 2: Put a record with value "value_15_bytes_", UTF-8 size = 15 bytes.
+        // Total buffered: 15. ( < 20)
+        task.put(Collections.singletonList(createRecord("topic0", 0, "k", "value_15_bytes_", 100, 1000)));
+        verify(mockedContext, times(0)).requestCommit();
+        verify(mockedContext, times(0)).pause(ArgumentMatchers.any());
+
+        // ACT & ASSERT - Step 3: Put a record with value "value6", UTF-8 size = 6 bytes.
+        // Total buffered: 15 + 6 = 21. ( > 20) -> Should trigger pause and commit.
+        task.put(Collections.singletonList(createRecord("topic0", 0, "k", "value6", 101, 1001)));
+        // Expect requestCommit and pause to be called exactly once.
+        verify(mockedContext, times(1)).requestCommit();
+        verify(mockedContext, times(1)).pause(ArgumentMatchers.eq(new TopicPartition[] { testTp }));
+
+        // ACT & ASSERT - Step 4: Put another record with value "a", UTF-8 size = 1 byte.
+        // Total buffered: 21 + 1 = 22. ( > 20). Since already paused, no *additional* calls.
+        task.put(Collections.singletonList(createRecord("topic0", 0, "k", "a", 102, 1002)));
+        verify(mockedContext, times(1)).requestCommit();
+        verify(mockedContext, times(1)).pause(ArgumentMatchers.any());
+
+        // ACT & ASSERT - Step 5: Call flush. This clears buffers and triggers resumeAll.
+        task.flush(Map.of(testTp, new OffsetAndMetadata(103)));
+        verify(mockedContext, times(1)).resume(ArgumentMatchers.eq(new TopicPartition[] { testTp }));
+
+        // ACT & ASSERT - Step 6: After flush, put records again. The size counter resets to 0.
+        // Put a record with value "value_15_bytes_", UTF-8 size = 15 bytes. Total buffered: 15. (< 20)
+        task.put(Collections.singletonList(createRecord("topic0", 0, "k", "value_15_bytes_", 103, 1003)));
+        // Still only 1 call for requestCommit/pause from before the flush.
+        verify(mockedContext, times(1)).requestCommit();
+        verify(mockedContext, times(1)).pause(ArgumentMatchers.any());
+        verify(mockedContext, times(1)).resume(ArgumentMatchers.any()); // Resume count remains 1
+    }
+
     @ParameterizedTest
     @ValueSource(strings = { "none", "gzip", "snappy", "zstd" })
     void compression(final String compression) {
         properties.put(GcsSinkConfig.FILE_COMPRESSION_TYPE_CONFIG, compression);
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
-
+        task.initialize(mockedContext);
         task.put(basicRecords);
         task.flush(null);
 
@@ -249,7 +310,9 @@ final class GcsSinkTaskTest {
     void contentEncodingAwareDownload(final String compression, final String encoding) {
         properties.put(GcsSinkConfig.FILE_COMPRESSION_TYPE_CONFIG, compression);
         properties.put(GcsSinkConfig.GCS_OBJECT_CONTENT_ENCODING_CONFIG, encoding);
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         task.put(basicRecords);
         task.flush(null);
@@ -283,7 +346,9 @@ final class GcsSinkTaskTest {
     void allFields(final String compression) {
         properties.put(GcsSinkConfig.FILE_COMPRESSION_TYPE_CONFIG, compression);
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_FIELDS_CONFIG, "key,value,timestamp,offset");
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         task.put(basicRecords);
         task.flush(null);
@@ -315,7 +380,9 @@ final class GcsSinkTaskTest {
     void nullKeyValueAndTimestamp(final String compression) {
         properties.put(GcsSinkConfig.FILE_COMPRESSION_TYPE_CONFIG, compression);
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_FIELDS_CONFIG, "key,value,timestamp,offset");
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         final List<SinkRecord> records = Arrays.asList(createNullRecord("topic0", 0, 10),
                 createNullRecord("topic0", 0, 11), createNullRecord("topic0", 0, 12));
@@ -333,7 +400,9 @@ final class GcsSinkTaskTest {
     @ValueSource(strings = { "none", "gzip", "snappy", "zstd" })
     void multipleFlush(final String compression) {
         properties.put(GcsSinkConfig.FILE_COMPRESSION_TYPE_CONFIG, compression);
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         task.put(List.of(createRecord("topic0", 0, "key0", "value0", 100, 1000)));
         task.put(List.of(createRecord("topic0", 0, "key1", "value1", 101, 1001)));
@@ -360,7 +429,9 @@ final class GcsSinkTaskTest {
     void maxRecordPerFile(final String compression) {
         properties.put(GcsSinkConfig.FILE_COMPRESSION_TYPE_CONFIG, compression);
         properties.put(GcsSinkConfig.FILE_MAX_RECORDS, "1");
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         final int recordNum = 100;
 
@@ -398,7 +469,7 @@ final class GcsSinkTaskTest {
         final var storage = FieldSupport.EXTRACTION.fieldValue("storage", Storage.class, task);
         final var retrySettings = storage.getOptions().getRetrySettings();
 
-        verify(mockedContext, never()).timeout(anyLong());
+        verify(mockedContext, never()).timeout(ArgumentMatchers.anyLong());
 
         final Map<String, String> headers = storage.getOptions()
                 .getMergedHeaderProvider(new NoHeaderProvider())
@@ -456,7 +527,9 @@ final class GcsSinkTaskTest {
     @Test
     void prefix() {
         properties.put(GcsSinkConfig.FILE_NAME_PREFIX_CONFIG, "prefix-");
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         task.put(basicRecords);
         task.flush(null);
@@ -472,7 +545,9 @@ final class GcsSinkTaskTest {
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_FIELDS_CONFIG, "key,value");
         properties.put("file.name.template", "{{key}}");
 
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         final List<SinkRecord> records = Arrays.asList(createRecordStringKey("topic0", 0, "key0", "value0", 10, 1000),
                 createRecordStringKey("topic0", 1, "key1", "value1", 20, 1001),
@@ -507,7 +582,9 @@ final class GcsSinkTaskTest {
         properties.put(GcsSinkConfig.FILE_COMPRESSION_TYPE_CONFIG, compression);
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_FIELDS_CONFIG, "key,value");
 
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         final List<SinkRecord> records = Arrays.asList(
                 createRecordWithStringValueSchema("topic0", 0, "key0", "value0", 10, 1000),
@@ -530,7 +607,9 @@ final class GcsSinkTaskTest {
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_FIELDS_CONFIG, "key,value");
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_TYPE_CONFIG, "jsonl");
 
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         final List<SinkRecord> records = Arrays.asList(
                 createRecordWithStringValueSchema("topic0", 0, "key0", "value0", 10, 1000),
@@ -558,7 +637,9 @@ final class GcsSinkTaskTest {
         final String compression = "none";
         properties.put(GcsSinkConfig.FILE_COMPRESSION_TYPE_CONFIG, compression);
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_FIELDS_CONFIG, "key,value");
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         final List<SinkRecord> records = Arrays.asList(
                 createRecordWithStructValueSchema("topic0", 0, "key0", "name0", 10, 1000),
@@ -581,7 +662,9 @@ final class GcsSinkTaskTest {
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_FIELDS_CONFIG, "key,value");
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_TYPE_CONFIG, "jsonl");
 
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         final List<SinkRecord> records = Arrays.asList(
                 createRecordWithStructValueSchema("topic0", 0, "key0", "name0", 10, 1000),
@@ -614,7 +697,9 @@ final class GcsSinkTaskTest {
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_ENVELOPE_CONFIG, "false");
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_TYPE_CONFIG, "jsonl");
 
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         final List<SinkRecord> records = Arrays.asList(
                 createRecordWithStructValueSchema("topic0", 0, "key0", "name0", 10, 1000),
@@ -641,7 +726,9 @@ final class GcsSinkTaskTest {
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_FIELDS_CONFIG, "key,value");
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_TYPE_CONFIG, "json");
 
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         final List<SinkRecord> records = Arrays.asList(
                 createRecordWithStructValueSchema("topic0", 0, "key0", "name0", 10, 1000),
@@ -674,7 +761,9 @@ final class GcsSinkTaskTest {
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_ENVELOPE_CONFIG, "false");
         properties.put(GcsSinkConfig.FORMAT_OUTPUT_TYPE_CONFIG, "json");
 
+        final var mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         final List<SinkRecord> records = Arrays.asList(
                 createRecordWithStructValueSchema("topic0", 0, "key0", "name0", 10, 1000),

@@ -83,6 +83,8 @@ public final class GcsSinkConfig extends AivenCommonConfig {
 
     public static final String GCS_RETRY_BACKOFF_MAX_ATTEMPTS_CONFIG = "gcs.retry.backoff.max.attempts";
 
+    public static final String GCS_RECORDS_BUFFERED_BYTES_SOFT_LIMIT_CONFIG = "gcs.records.buffered.bytes.soft.limit";
+
     // All default from GCS client, hardcoded here since GCS hadn't constants
     public static final long GCS_RETRY_BACKOFF_INITIAL_DELAY_MS_DEFAULT = 1_000L;
 
@@ -93,6 +95,8 @@ public final class GcsSinkConfig extends AivenCommonConfig {
     public static final long GCS_RETRY_BACKOFF_TOTAL_TIMEOUT_MS_DEFAULT = 50_000L;
 
     public static final int GCS_RETRY_BACKOFF_MAX_ATTEMPTS_DEFAULT = 6;
+
+    public static final long GCS_RECORDS_BUFFERED_BYTES_SOFT_LIMIT_DEFAULT = 100_000_000L;
 
     public static final String NAME_CONFIG = "name";
 
@@ -107,6 +111,7 @@ public final class GcsSinkConfig extends AivenCommonConfig {
         addKafkaBackoffPolicy(configDef);
         addGcsRetryPolicies(configDef);
         addUserAgentConfig(configDef);
+        addSinkTaskConfig(configDef);
         return configDef;
     }
 
@@ -299,6 +304,16 @@ public final class GcsSinkConfig extends AivenCommonConfig {
 
     }
 
+    private static void addSinkTaskConfig(final ConfigDef configDef) {
+        configDef.define(GCS_RECORDS_BUFFERED_BYTES_SOFT_LIMIT_CONFIG, ConfigDef.Type.LONG,
+                GCS_RECORDS_BUFFERED_BYTES_SOFT_LIMIT_DEFAULT, ConfigDef.Range.atLeast(0), ConfigDef.Importance.MEDIUM,
+                "The soft limit in bytes for records buffered in memory across all topic partitions. "
+                        + "If this limit is exceeded, the connector will trigger flushing of buffered records to GCS "
+                        + "and may pause partitions to prevent further memory accumulation. "
+                        + "Must be a non-negative long. A value of 0 disables this soft limit. "
+                        + "The default value is " + GCS_RECORDS_BUFFERED_BYTES_SOFT_LIMIT_DEFAULT + " (100 MB).");
+    }
+
     public GcsSinkConfig(final Map<String, String> properties) {
         super(configDef(), handleDeprecatedYyyyUppercase(properties));
         validate();
@@ -437,5 +452,9 @@ public final class GcsSinkConfig extends AivenCommonConfig {
 
     public String getUserAgent() {
         return getString(GCS_USER_AGENT);
+    }
+
+    public long getGcsRecordsBufferedBytesSoftLimit() {
+        return getLong(GCS_RECORDS_BUFFERED_BYTES_SOFT_LIMIT_CONFIG);
     }
 }
