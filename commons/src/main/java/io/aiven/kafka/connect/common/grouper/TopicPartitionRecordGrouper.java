@@ -43,7 +43,7 @@ import io.aiven.kafka.connect.common.templating.VariableTemplatePart.Parameter;
  * <p>
  * The class supports limited and unlimited number of records in files.
  */
-class TopicPartitionRecordGrouper implements RecordGrouper {
+public class TopicPartitionRecordGrouper implements RecordGrouper {
 
     private final Template filenameTemplate;
 
@@ -127,6 +127,14 @@ class TopicPartitionRecordGrouper implements RecordGrouper {
     @Override
     public void clear() {
         currentHeadRecords.clear();
+        fileBuffers.clear();
+    }
+
+    /**
+     * Clears only the buffered records, keeping the head records for consistent filenames.
+     * This is called by GcsSinkTask.writeBufferedRecordsToGcs() to free up memory.
+     */
+    public void clearFileBuffers() {
         fileBuffers.clear();
     }
 
