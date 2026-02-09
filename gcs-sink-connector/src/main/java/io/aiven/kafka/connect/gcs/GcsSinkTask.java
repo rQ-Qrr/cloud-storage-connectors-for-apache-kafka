@@ -331,11 +331,7 @@ public final class GcsSinkTask extends SinkTask {
             this.config = config;
         }
 
-        /**
-         * Adds a record's metadata to the tracking maps.
-         *
-         * @return The estimated size of the record in bytes.
-         */
+        // Add a record to the tracking maps.
         long addRecord(final String recordKey, final SinkRecord record) {
             final long recordSize = estimateRecordSize(record);
             fileBufferBytes.put(recordKey, fileBufferBytes.getOrDefault(recordKey, 0L) + recordSize);
@@ -351,7 +347,7 @@ public final class GcsSinkTask extends SinkTask {
                 }
             }
             return config.getMaxRecordsPerFile() > 0
-                && fileRecordCounts.getOrDefault(recordKey, 0) >= config.getMaxRecordsPerFile();
+                    && fileRecordCounts.getOrDefault(recordKey, 0) >= config.getMaxRecordsPerFile();
         }
 
         void clearAll() {
