@@ -592,6 +592,20 @@ gcs.credentials.default=true
 # Optional, the default is null.
 gcs.object.content.encoding=gzip
 
+# The soft limit in bytes for records buffered in memory across all topic partitions within this sink task.
+# This setting enables flow control to prevent OutOfMemory errors by managing the connector's internal buffer size.
+#
+# When the total size of buffered records exceeds this limit, the sink task will:
+# - Call `context.pause()` to temporarily stop fetching new records from Kafka.
+# - Call `context.requestCommit()` to signal the Kafka Connect framework to trigger a `flush()` operation.
+# This causes the currently buffered records to be written to GCS, freeing up memory. Once flushed, partitions are resumed.
+#
+# This can be used to tune memory usage and task stability:
+# - Set a value appropriate for the worker's available memory and the number of tasks running.
+# - Helps prevent tasks from OOMing under high throughput by actively managing memory consumption.
+# Optional. The default value is 100000000 (100 MB). A value of 0 is interpreted as disabled.
+gcs.records.buffered.bytes.soft.limit=100000000
+
 # The set of the fields that are to be output, comma separated.
 # Supported values are: `key`, `value`, `offset`, `timestamp`, and `headers`.
 # Optional, the default is `value`.
