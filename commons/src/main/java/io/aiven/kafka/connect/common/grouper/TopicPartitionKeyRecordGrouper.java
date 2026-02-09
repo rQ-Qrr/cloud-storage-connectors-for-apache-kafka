@@ -65,10 +65,12 @@ public class TopicPartitionKeyRecordGrouper implements RecordGrouper {
     }
 
     @Override
-    public void put(final SinkRecord record) {
+    public String put(final SinkRecord record) {
         Objects.requireNonNull(record, "record cannot be null");
         final String recordKey = resolveRecordKeyFor(record);
         fileBuffers.computeIfAbsent(recordKey, ignored -> new ArrayList<>()).add(record);
+
+        return recordKey;
     }
 
     protected String resolveRecordKeyFor(final SinkRecord record) {

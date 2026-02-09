@@ -56,15 +56,14 @@ public final class GcsSinkTask extends SinkTask {
     private Storage storage;
 
     private TopicPartitionManager topicPartitionManager;
+    private BufferTracker bufferTracker;
     private final Map<String, GcsBlobWriter> activeBlobWriters = new HashMap<>();
-
     private static final long GCS_WRITE_BUFFER_SIZE_BYTES_PER_TASK = 60 * 1024 * 1024L; // 60 MiB
     private static final long GCS_WRITE_INTERVAL_MS = 10_000L; // 10 seconds
 
     private long currentBufferedBytes;
     final Clock clock;
     private long lastWriteMs;
-
     private boolean isOneRecordPerFile;
 
     // required by Connect
@@ -131,6 +130,7 @@ public final class GcsSinkTask extends SinkTask {
                 this.isOneRecordPerFile = true;
             }
             this.lastWriteMs = clock.millis();
+            this.bufferTracker = new BufferTracker(config);
         } catch (final Exception e) { // NOPMD broad exception caught
             throw new ConnectException("Unsupported file name template " + config.getFilename(), e);
         }
@@ -140,10 +140,15 @@ public final class GcsSinkTask extends SinkTask {
     public void put(final Collection<SinkRecord> records) {
         Objects.requireNonNull(records, "records cannot be null");
         LOG.debug("Buffering {} records. Current buffer size: {} bytes", records.size(), currentBufferedBytes);
+        boolean shouldRequestCommit = false;
         for (final SinkRecord record : records) {
-            recordGrouper.put(record);
+            final String recordKey = recordGrouper.put(record);
             if (!isOneRecordPerFile) {
-                currentBufferedBytes += estimateRecordSize(record);
+                final long recordSize = bufferTracker.addRecord(recordKey, record);
+                currentBufferedBytes += recordSize;
+                if (bufferTracker.isThresholdReached(recordKey)) {
+                    shouldRequestCommit = true;
+                }
             }
         }
 
@@ -167,6 +172,10 @@ public final class GcsSinkTask extends SinkTask {
         }
         // check if we should resume topics
         checkRecordSize();
+
+        if (shouldRequestCommit) {
+            topicPartitionManager.requestCommit();
+        }
     }
 
     @Override
@@ -200,6 +209,7 @@ public final class GcsSinkTask extends SinkTask {
 
         activeBlobWriters.clear();
         recordGrouper.clear();
+        bufferTracker.clearAll();
 
         if (firstException != null) {
             // If any file failed to close, throw an exception to prevent offset commit.
@@ -223,6 +233,7 @@ public final class GcsSinkTask extends SinkTask {
         }
         activeBlobWriters.clear();
         recordGrouper.clear();
+        bufferTracker.clearAll();
         currentBufferedBytes = 0;
         lastWriteMs = clock.millis();
     }
@@ -262,7 +273,7 @@ public final class GcsSinkTask extends SinkTask {
                         .values()
                         .stream()
                         .flatMap(List::stream)
-                        .mapToLong(this::estimateRecordSize)
+                        .mapToLong(bufferTracker::estimateRecordSize)
                         .sum();
         this.lastWriteMs = clock.millis();
 
@@ -311,43 +322,80 @@ public final class GcsSinkTask extends SinkTask {
         }
     }
 
-    // Estimates the size of a SinkRecord in bytes. This is a rough approximation based on the byte
-    // length of the key and value's String representation. The actual size written to GCS can vary
-    // due to serialization format and compression.
-    private long estimateRecordSize(final SinkRecord record) {
-        long size = 0;
-        if (record.key() != null) {
-            size += getObjectSize(record.key());
-        }
-        if (record.value() != null) {
-            size += getObjectSize(record.value());
-        }
-        // Add a small constant overhead for record metadata
-        size += 20;
-        return size;
-    }
+    private final static class BufferTracker {
+        private final Map<String, Long> fileBufferBytes = new HashMap<>();
+        private final Map<String, Integer> fileRecordCounts = new HashMap<>();
+        private final GcsSinkConfig config;
 
-    private long getObjectSize(final Object data) {
-        if (data instanceof byte[]) {
-            return ((byte[]) data).length;
-        } else if (data instanceof String) {
-            return ((String) data).getBytes(StandardCharsets.UTF_8).length;
-        } else {
-            return data.toString().getBytes(StandardCharsets.UTF_8).length;
+        BufferTracker(final GcsSinkConfig config) {
+            this.config = config;
+        }
+
+        /**
+         * Adds a record's metadata to the tracking maps.
+         *
+         * @return The estimated size of the record in bytes.
+         */
+        long addRecord(final String recordKey, final SinkRecord record) {
+            final long recordSize = estimateRecordSize(record);
+            fileBufferBytes.put(recordKey, fileBufferBytes.getOrDefault(recordKey, 0L) + recordSize);
+            fileRecordCounts.put(recordKey, fileRecordCounts.getOrDefault(recordKey, 0) + 1);
+            return recordSize;
+        }
+
+        boolean isThresholdReached(final String recordKey) {
+            if (config.isMaxBytesPerFileLimited()) {
+                final Long currentBytes = fileBufferBytes.get(recordKey);
+                if (currentBytes != null && currentBytes >= config.getMaxBytesPerFile()) {
+                    return true;
+                }
+            }
+            return config.getMaxRecordsPerFile() > 0
+                && fileRecordCounts.getOrDefault(recordKey, 0) >= config.getMaxRecordsPerFile();
+        }
+
+        void clearAll() {
+            fileBufferBytes.clear();
+            fileRecordCounts.clear();
+        }
+
+        // Estimates the size of a SinkRecord in bytes. This is a rough approximation based on the byte
+        // length of the key and value's String representation.
+        long estimateRecordSize(final SinkRecord record) {
+            long size = 20; // Constant overhead
+            if (record.key() != null) {
+                size += getObjectSize(record.key());
+            }
+            if (record.value() != null) {
+                size += getObjectSize(record.value());
+            }
+            return size;
+        }
+
+        private long getObjectSize(final Object data) {
+            if (data instanceof byte[]) {
+                return ((byte[]) data).length;
+            } else if (data instanceof String) {
+                return ((String) data).getBytes(StandardCharsets.UTF_8).length;
+            } else {
+                return String.valueOf(data).getBytes(StandardCharsets.UTF_8).length;
+            }
         }
     }
 
     private class TopicPartitionManager {
 
         private Long lastChangeMs;
+        private Long lastCommitMs;
         private boolean isPaused;
 
         public TopicPartitionManager() {
             this.lastChangeMs = clock.millis();
+            this.lastCommitMs = clock.millis();
             this.isPaused = false;
         }
 
-        public void pauseAll() {
+        private void pauseAll() {
             if (!isPaused) {
                 final long now = clock.millis();
                 LOG.debug("Paused all partitions after {}ms", now - lastChangeMs);
@@ -359,7 +407,7 @@ public final class GcsSinkTask extends SinkTask {
             context.pause(assignment.toArray(topicPartitions));
         }
 
-        public void resumeAll() {
+        private void resumeAll() {
             if (isPaused) {
                 final long now = clock.millis();
                 LOG.debug("Resumed all partitions after {}ms", now - lastChangeMs);
@@ -369,6 +417,13 @@ public final class GcsSinkTask extends SinkTask {
                 final TopicPartition[] topicPartitions = new TopicPartition[assignment.size()];
                 context.resume(assignment.toArray(topicPartitions));
             }
+        }
+
+        private void requestCommit() {
+            final long now = clock.millis();
+            LOG.debug("Requesting commit for all partitions after {}ms", now - lastCommitMs);
+            lastCommitMs = now;
+            context.requestCommit();
         }
     }
 }

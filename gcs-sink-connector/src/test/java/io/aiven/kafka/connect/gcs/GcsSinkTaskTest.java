@@ -462,6 +462,65 @@ final class GcsSinkTaskTest {
         assertThat(testBucketAccessor.getBlobNames()).containsExactly("key0" + compressionType.extension());
     }
 
+    @Test
+    void shouldRequestCommitWhenMaxRecordsPerFileExceeded() {
+        properties.put(GcsSinkConfig.FILE_MAX_RECORDS, "2");
+
+        final SinkTaskContext mockedContext = mock(SinkTaskContext.class);
+        final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
+
+        task.put(List.of(createRecord("topic0", 0, "key0", "val0", 10, 1000)));
+        verify(mockedContext, never()).requestCommit();
+
+        task.put(List.of(createRecord("topic0", 0, "key1", "val1", 11, 1001)));
+
+        // Verify the signal was sent to the Worker
+        verify(mockedContext).requestCommit();
+    }
+
+    @Test
+    void shouldRequestCommitWhenMaxBytesPerFileExceeded() {
+        properties.put(GcsSinkConfig.FILE_MAX_BYTES, "100");
+
+        final SinkTaskContext mockedContext = mock(SinkTaskContext.class);
+        final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
+
+        final byte[] largeValue = new byte[40];
+        final SinkRecord record = new SinkRecord("topic0", 0, Schema.STRING_SCHEMA, "key", Schema.BYTES_SCHEMA,
+                largeValue, 10, 1000L, TimestampType.CREATE_TIME);
+
+        task.put(List.of(record));
+        verify(mockedContext, never()).requestCommit();
+
+        task.put(List.of(record));
+
+        // Verify the threshold check triggered the request
+        verify(mockedContext).requestCommit();
+    }
+
+    @Test
+    void shouldNotRequestCommitWhenOneRecordPerFileIsActive() {
+        properties.put("file.name.template", "{{key}}");
+        properties.put(GcsSinkConfig.FILE_MAX_RECORDS, "1");
+        properties.put(GcsSinkConfig.FILE_MAX_BYTES, "100");
+
+        final SinkTaskContext mockedContext = mock(SinkTaskContext.class);
+        final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
+
+        final byte[] largeValue = new byte[40];
+        final SinkRecord record = new SinkRecord("topic0", 0, Schema.STRING_SCHEMA, "key", Schema.BYTES_SCHEMA,
+                largeValue, 10, 1000L, TimestampType.CREATE_TIME);
+
+        task.put(List.of(record));
+        verify(mockedContext, never()).requestCommit();
+
+        task.put(List.of(record));
+        verify(mockedContext, never()).requestCommit();
+    }
+
     @ParameterizedTest
     @ValueSource(strings = { "none", "gzip", "snappy", "zstd" })
     void nullKeyValueAndTimestamp(final String compression) {
@@ -512,7 +571,9 @@ final class GcsSinkTaskTest {
     void maxRecordPerFile(final String compression) {
         properties.put(GcsSinkConfig.FILE_COMPRESSION_TYPE_CONFIG, compression);
         properties.put(GcsSinkConfig.FILE_MAX_RECORDS, "1");
+        final SinkTaskContext mockedContext = mock(SinkTaskContext.class);
         final GcsSinkTask task = new GcsSinkTask(properties, storage);
+        task.initialize(mockedContext);
 
         final int recordNum = 100;
 
