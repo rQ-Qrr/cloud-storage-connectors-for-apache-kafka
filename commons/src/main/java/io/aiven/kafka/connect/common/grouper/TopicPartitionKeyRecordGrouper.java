@@ -128,13 +128,10 @@ public class TopicPartitionKeyRecordGrouper implements RecordGrouper {
         fileBuffers.clear();
     }
 
-
-    /**
-     * Clears only the buffered records, keeping the head records for consistent filenames.
-     * This is called by GcsSinkTask.writeBufferedRecordsToGcs() to free up memory.
-     */
-    public void clearFileBuffers() {
-        fileBuffers.clear();
+    // Clears only the buffered records, keeping the head records for consistent filenames.
+    public void clearFileBuffers(final String filename) {
+        Objects.requireNonNull(filename, "filename cannot be null");
+        fileBuffers.remove(filename);
     }
 
     @Override
